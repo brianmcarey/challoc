@@ -261,7 +261,9 @@ const PINS: &[(&str, &[&str])] = &[
             "let Some(slab) = line.set_slab(p, table) else {",
         ],
     ),
-    // `free_fast_slot` and `free_fast_tail` (tests/loom/src/free.rs).
+    // `free_fast_slot` and `free_fast_tail` (tests/loom/src/free.rs). The
+    // general arm's `FREE_EPOCH` test before the route check is a bit of
+    // the `flags` byte already read, not an atomic access.
     (
         "src/heap/paths.rs",
         &[
@@ -270,7 +272,8 @@ const PINS: &[(&str, &[&str])] = &[
             "0 => unsafe { heap_from_slot(t, tp, false, Tracked(&tls.cell), Tracked(&mut tls.loan)) }.push_fast(",
             "FREE_ROUTE => {",
             "shared.home_owns(class, slab, h) && h.push_fast(class, p, 0, Tracked(&mut tk))",
-            "(flags & FREE_ROUTE == 0 || shared.home_owns(class, slab, h))",
+            "flags & FREE_EPOCH == 0",
+            "&& (flags & FREE_ROUTE == 0 || shared.home_owns(class, slab, h))",
         ],
     ),
     // `mirror_watermark`, take_group's lock, bound, check_zero comparison,
@@ -345,11 +348,14 @@ const PINS: &[(&str, &[&str])] = &[
             "if let Some(arena) = shared.arenas.get_existing(i as u16) {",
         ],
     ),
-    // `put_flags`, `set_multi_arena`, `free_flags` (tests/loom/src/flags.rs).
+    // `put_flags`, `set_multi_arena`, `set_epoch`, `free_flags`
+    // (tests/loom/src/flags.rs).
     (
         "src/heap/shared.rs",
         &[
             "crate::vspec::flags::fetch_or(&self.free_flags, FREE_ROUTE);",
+            "crate::vspec::flags::fetch_or(&self.free_flags, FREE_EPOCH);",
+            "crate::vspec::flags::fetch_and(&self.free_flags, !FREE_EPOCH);",
             "ptr_mut_write(field_at(this, S_PUSH_FLAGS), Tracked(pf), flags);",
             "ptr_mut_write(field_at(this, S_FREE_FLAGS), Tracked(pa), crate::vspec::flags::new(flags));",
             "crate::vspec::flags::load(&self.free_flags)",

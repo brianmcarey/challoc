@@ -3065,6 +3065,87 @@ proof fn lemma_user_block_shrink(p: usize, big: int, small: int)
     }
 }
 
+/// `challoc_cow_begin`: open a fork epoch (`crate::cow`; design 5, "Fork
+/// epochs", and 13.7), to be called just before `fork(2)` by the thread
+/// that forks. Returns the calling thread's cached slots to their slabs and
+/// purges every `Empty` slab and huge extent (as `malloc_trim`), so that
+/// the child pins none of the parent's free memory and the refills of the
+/// epoch can reuse those pages without copying; then sets the floors.
+/// Epochs nest. 0 on success (and before init, when nothing is allocated
+/// for a child to share), `EINVAL` for a `flags` other than 0, `ENOTSUP`
+/// with `cow_epoch:false`, `EBUSY` (no epoch opened) while another
+/// thread's outermost begin or end is under way (`crate::cow::begin`), and
+/// `EBUSY` inside the fork window (`lock::in_fork_window`: an atfork
+/// handler of the forking thread, in the parent or the child): the child's
+/// handler clears every epoch (`cow::fork_child`), so one opened by a child
+/// handler that runs before it would be lost, and design 9 keeps the
+/// state fork handlers reset unchanged in that window.
+pub fn cow_begin(flags: u32, Tracked(ord): Tracked<&mut crate::lock::LockOrder>) -> (r: c_int)
+    requires
+        crate::sys::may_abort(),
+        crate::sys::may_syscall(),
+        old(ord).top() == 0,
+    ensures
+        *final(ord) == *old(ord),
+{
+    if flags != 0 {
+        return EINVAL;
+    }
+    let Some(shared) = super::shared_if_ready() else { return 0 };
+    if !shared.cow_enabled() {
+        return crate::cow::ENOTSUP;
+    }
+    if crate::lock::in_fork_window() {
+        return crate::cow::EBUSY;
+    }
+    if !crate::cow::open() {
+        if let Some(h) = heap::existing_heap(heap::shared_ptr(shared)) {
+            h.flush_all(shared, Tracked(&mut *ord));
+        }
+        let tracked mut left = Ghost(crate::purge::Left::none());
+        crate::purge::purge_all(shared, Tracked(&mut left), Tracked(&mut *ord));
+    }
+    crate::cow::begin(shared, Tracked(&mut *ord))
+}
+
+/// `challoc_cow_end`: close the fork epoch [`cow_begin`] opened, to be
+/// called once the child has exited (and on a failed `fork`). The floors
+/// become drain floors (`crate::cow::drain_move`). 0, also with no epoch
+/// open (`crate::cow::end`'s `EINVAL`, which an end with no matching
+/// begin gets); `EAGAIN` when other threads' begins and ends kept moving
+/// the depth and this end did not count: the caller calls it again.
+pub fn cow_end(Tracked(ord): Tracked<&mut crate::lock::LockOrder>) -> (r: c_int)
+    requires
+        crate::sys::may_syscall(),
+        old(ord).top() == 0,
+    ensures
+        *final(ord) == *old(ord),
+{
+    let Some(shared) = super::shared_if_ready() else { return 0 };
+    if !crate::cow::open() {
+        return 0;
+    }
+    if crate::cow::end(shared, Tracked(ord)) == crate::cow::EAGAIN {
+        return crate::cow::EAGAIN;
+    }
+    0
+}
+
+/// `challoc_cow_stat(which)`: one figure of the fork epochs
+/// ([`crate::cow::stat`]); 0 before init.
+pub fn cow_stat(which: u32, Tracked(ord): Tracked<&mut crate::lock::LockOrder>) -> u64
+    requires
+        crate::sys::may_syscall(),
+        old(ord).top() == 0,
+    ensures
+        *final(ord) == *old(ord),
+{
+    match super::shared_if_ready() {
+        Some(shared) => crate::cow::stat(shared, which, Tracked(ord)),
+        None => 0,
+    }
+}
+
 /// `malloc_trim`: return the calling thread's cached slots to their slabs,
 /// then purge every `Empty` slab and huge extent whatever its age (design
 /// section 8). Returns 1 if anything was purged, 0 otherwise or before
@@ -3597,6 +3678,40 @@ mod exports {
             axiom_out_at_return(uout, usable);
         }
         r
+    }
+
+    // challoc's fork epochs (design 13.7, `crate::cow`), declared in
+    // <challoc/challoc.h>.
+
+    #[unsafe(no_mangle)]
+    #[verifier::assume_unsupported_attributes]
+    pub extern "C" fn challoc_cow_begin(flags: core::ffi::c_uint) -> c_int {
+        proof {
+            crate::sys::grant_syscalls();
+            crate::sys::grant_aborts();
+        }
+        let tracked mut ord = crate::lock::axiom_c_entry();
+        super::cow_begin(flags, Tracked(&mut ord))
+    }
+
+    #[unsafe(no_mangle)]
+    #[verifier::assume_unsupported_attributes]
+    pub extern "C" fn challoc_cow_end() -> c_int {
+        proof {
+            crate::sys::grant_syscalls();
+        }
+        let tracked mut ord = crate::lock::axiom_c_entry();
+        super::cow_end(Tracked(&mut ord))
+    }
+
+    #[unsafe(no_mangle)]
+    #[verifier::assume_unsupported_attributes]
+    pub extern "C" fn challoc_cow_stat(which: core::ffi::c_uint) -> u64 {
+        proof {
+            crate::sys::grant_syscalls();
+        }
+        let tracked mut ord = crate::lock::axiom_c_entry();
+        super::cow_stat(which, Tracked(&mut ord))
     }
 
     #[unsafe(no_mangle)]

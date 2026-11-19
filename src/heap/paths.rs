@@ -27,7 +27,9 @@ use super::{
     lemma_hint_ok, lemma_plain_stored, pac_mode, regions_ok, slot_ok, slot_ptr, slot_start,
     slot_token,
 };
-use super::{FOREIGN, FREE_ROUTE, Heap, Live, PUSH_PAC, Shared, existing_heap};
+use super::{
+    FOREIGN, FREE_DYN, FREE_EPOCH, FREE_ROUTE, Heap, Live, PUSH_PAC, Shared, existing_heap,
+};
 #[cfg(verus_keep_ghost)]
 use crate::layout::{class_table, process_regions};
 
@@ -268,8 +270,19 @@ impl Heap {
                     blk.lemma_claims_slot(p, class as int);
                 }
                 // The freed slot's token, with the permission to its bytes.
+                // During a fork epoch a slot below its arena's floor goes
+                // the way of another arena's: onto the flush-only
+                // `FOREIGN` cache, so that `malloc` does not hand it out
+                // again while a fork child may share its page (`crate::cow`).
+                // The epoch test inline is one load; what follows it is a
+                // tail call out of line (`free_epoch`), so outside an epoch
+                // the home push keeps its registers.
                 if arena == self.arena {
-                    self.push(shared, class, p, Tracked(blk), Tracked(errno), Tracked(cell), Tracked(ord))
+                    if crate::cow::in_force() {
+                        self.free_epoch(shared, class, p, Tracked(blk), Tracked(errno), Tracked(cell), Tracked(ord))
+                    } else {
+                        self.push(shared, class, p, Tracked(blk), Tracked(errno), Tracked(cell), Tracked(ord))
+                    }
                 } else {
                     self.free_other(shared, class, p, Tracked(blk), Tracked(errno), Tracked(cell), Tracked(ord))
                 }
@@ -280,6 +293,46 @@ impl Heap {
                 }
                 self.free_huge(shared, page, Tracked(blk), Tracked(ord))
             },
+        }
+    }
+
+    /// [`Heap::free`] of a home slot while a fork epoch's floors hold
+    /// (`crate::cow`): a slot below its arena's floor takes the `FOREIGN`
+    /// route ([`Shared::cow_deflects`]), any other the home push. Cold and
+    /// out of line, the tail of `free`'s home branch.
+    #[cold]
+    #[inline(never)]
+    // The tracked tokens (`blk`, `errno`, the slot cell, `ord`) are ghost.
+    #[allow(clippy::too_many_arguments)]
+    fn free_epoch(
+        &mut self,
+        shared: &Shared,
+        class: usize,
+        p: *mut u8,
+        Tracked(blk): Tracked<Live>,
+        Tracked(errno): Tracked<&mut ThreadErrno>,
+        Tracked(cell): Tracked<&mut crate::sys::tls::TlsCell>,
+        Tracked(ord): Tracked<&mut crate::lock::LockOrder>,
+    )
+        requires
+            crate::sys::may_abort() || crate::sys::valid_aborts(),
+            crate::sys::may_syscall(),
+            process_regions().is_slot(class as int, p@.addr),
+            blk.slot_block(p, class as int),
+            shared.wf(),
+            class < NCLASSES,
+            old(self).wf(),
+            old(ord).top() == 0,
+        ensures
+            final(errno).val() == old(errno).val(),
+            final(self).wf(),
+            final(cell).kept(*old(cell)),
+            *final(ord) == *old(ord),
+    {
+        if shared.cow_deflects(self.arena, class, p) {
+            self.free_other(shared, class, p, Tracked(blk), Tracked(errno), Tracked(cell), Tracked(ord))
+        } else {
+            self.push(shared, class, p, Tracked(blk), Tracked(errno), Tracked(cell), Tracked(ord))
         }
     }
 
@@ -789,6 +842,7 @@ impl Heap {
         if arena == FOREIGN
             && self.rehome
             && !shared.double_free_scan()
+            && !crate::cow::open()
             && self.rehome_on_free(shared, class, p, Tracked(&mut blk), Tracked(&mut *ord), Tracked(&mut *errno), Tracked(&mut *cell))
         {
             return;
@@ -940,7 +994,10 @@ pub unsafe fn free_fast_slot(
 
 /// After the bit test: the heap from the slot value `t`, authenticated
 /// against `tp` when `flags` carries [`PUSH_PAC`], the owner-word test
-/// with [`FREE_ROUTE`], the push. `blk` as for [`free_fast_slot`].
+/// with [`FREE_ROUTE`], the push. With [`FREE_EPOCH`] (a fork epoch,
+/// `crate::cow`) it declines, and the slow path keeps a slot below its
+/// arena's floor out of the cache `malloc` pops. `blk` as for
+/// [`free_fast_slot`].
 ///
 /// # Safety
 /// `(t, tp)` from [`tls_heap_slot`](super::thread::tls_heap_slot) on this
@@ -965,7 +1022,7 @@ unsafe fn free_fast_tail(
         class < NCLASSES,
         process_regions().is_slot(class as int, p@.addr),
         slab < shared.tables[class as int].spec_nslabs(),
-        flags & !FREE_ROUTE == shared.route_fixed(),
+        flags & !FREE_DYN == shared.route_fixed(),
         old(blk).claims(p),
         slot_ok(old(tls).cell, old(tls).loan),
         t == old(tls).value(),
@@ -992,9 +1049,9 @@ unsafe fn free_fast_tail(
         shared.lemma_route_flags(flags);
     }
     // The two default configurations (one arena, several arenas) each get
-    // one compare and the plain push; the opt-in hardening takes the
-    // general dispatch. `flags` carries the process's `PUSH_PAC`, clear in
-    // both default configurations.
+    // one compare and the plain push; the opt-in hardening and a fork
+    // epoch take the general dispatch. `flags` carries the process's
+    // `PUSH_PAC`, clear in both default configurations.
     let pushed = match flags {
         // SAFETY: `(t, tp)` is this thread's slot (the caller's contract),
         // and `flags == 0` means `PUSH_PAC` is clear.
@@ -1012,8 +1069,12 @@ unsafe fn free_fast_tail(
         _ => {
             // SAFETY: as above; the `PUSH_PAC` bit passed is the process's.
             let h = unsafe { heap_from_slot(t, tp, flags & PUSH_PAC != 0, Tracked(&tls.cell), Tracked(&mut tls.loan)) };
-            (flags & FREE_ROUTE == 0 || shared.home_owns(class, slab, h))
-                && h.push_fast(class, p, flags & !FREE_ROUTE, Tracked(&mut tk))
+            // A fork epoch (`FREE_EPOCH`) declines every free: the slow
+            // path keeps a slot below its arena's floor out of the cache
+            // `malloc` pops (`Heap::free`, `Shared::cow_deflects`).
+            flags & FREE_EPOCH == 0
+                && (flags & FREE_ROUTE == 0 || shared.home_owns(class, slab, h))
+                && h.push_fast(class, p, flags & !FREE_DYN, Tracked(&mut tk))
         }
     };
     proof {
@@ -1025,17 +1086,17 @@ unsafe fn free_fast_tail(
 }
 
 /// The bits of a `free_flags` byte the dispatch of [`free_fast_tail`]
-/// passes on: the byte without [`FREE_ROUTE`] keeps its [`PUSH_PAC`] and
+/// passes on: the byte without [`FREE_DYN`] keeps its [`PUSH_PAC`] and
 /// [`PUSH_ZERO`] bits, and `0` and `FREE_ROUTE` have neither.
 proof fn lemma_free_route_bits(flags: u8)
     ensures
-        (flags & !FREE_ROUTE) & PUSH_PAC == flags & PUSH_PAC,
-        (flags & !FREE_ROUTE) & PUSH_ZERO == flags & PUSH_ZERO,
+        (flags & !FREE_DYN) & PUSH_PAC == flags & PUSH_PAC,
+        (flags & !FREE_DYN) & PUSH_ZERO == flags & PUSH_ZERO,
         flags == 0 || flags == FREE_ROUTE ==> flags & PUSH_PAC == 0 && flags & PUSH_ZERO == 0,
         0u8 & PUSH_PAC == 0,
 {
-    assert((flags & !8u8) & 4u8 == flags & 4u8) by (bit_vector);
-    assert((flags & !8u8) & 2u8 == flags & 2u8) by (bit_vector);
+    assert((flags & !24u8) & 4u8 == flags & 4u8) by (bit_vector);
+    assert((flags & !24u8) & 2u8 == flags & 2u8) by (bit_vector);
     assert(flags == 0u8 || flags == 8u8 ==> flags & 4u8 == 0u8 && flags & 2u8 == 0u8) by (bit_vector);
     assert(0u8 & 4u8 == 0u8) by (bit_vector);
 }
@@ -1054,6 +1115,13 @@ proof fn lemma_free_route_bits(flags: u8)
 /// no call. `blk` holds the token for `p`: a push takes its slot token,
 /// and a declined push gives `blk` back the token with a fresh permission
 /// to the slot, its bytes unknown.
+///
+/// The push reads `Shared::free_flags` in place of `flags`
+/// (`push_flags`, the same bits but the dynamic ones, on the same line),
+/// where `push_flags` was read: during a fork epoch ([`FREE_EPOCH`],
+/// `crate::cow`) every sized free is declined, since the push skips the
+/// slot's owner and floor tests and would put a slot below its arena's
+/// floor in the cache `malloc` pops; the exact `free` then keeps it out.
 #[inline(always)]
 pub fn free_sized_fast(
     shared: &Shared,
@@ -1065,8 +1133,7 @@ pub fn free_sized_fast(
 ) -> (r: bool)
     requires
         shared.wf(),
-        (flags & PUSH_PAC != 0) == pac_mode(),
-        (flags & PUSH_PAC != 0) ==> pac::pac_available(),
+        flags == shared.flags(),
         hint matches Some(c) ==> c < NCLASSES,
         old(h).wf(),
         old(blk).claims(p),
@@ -1082,8 +1149,19 @@ pub fn free_sized_fast(
         !r ==> *final(blk) == *old(blk) || old(blk).block(p),
         r ==> old(blk).block(p),
 {
+    // `flags` (`push_flags`) is the bits the push gets; the byte read for
+    // the push carries them, and the dynamic ones (`lemma_route_flags`).
+    let _ = flags;
     match shared.sized_slot(p, hint) {
         Some(class) => {
+            let ff = shared.free_flags();
+            if ff & FREE_EPOCH != 0 {
+                return false;
+            }
+            proof {
+                lemma_free_route_bits(ff);
+                shared.lemma_route_flags(ff);
+            }
             let tracked mut tk = Map::<int, GhostSingleton<int>>::tracked_empty();
             let ghost orig = *blk;
             proof {
@@ -1092,7 +1170,7 @@ pub fn free_sized_fast(
                 lend_slot(blk, &mut tk, class as int, p);
                 assert(process_regions().is_slot(class as int, p@.addr));
             }
-            let r = h.push_fast(class, p, flags, Tracked(&mut tk));
+            let r = h.push_fast(class, p, ff & !FREE_DYN, Tracked(&mut tk));
             proof {
                 if !r {
                     blk.put_slot(tk.tracked_remove(0), orig, p, class as int);

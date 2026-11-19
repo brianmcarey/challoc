@@ -199,6 +199,18 @@ pub const PUSH_PAC: u8 = 4;
 /// home arena before pushing.
 pub const FREE_ROUTE: u8 = 8;
 
+/// `Shared::free_flags` bit, never in `push_flags`: a fork epoch is open
+/// (`crate::cow`), so the `free` and sized `free` fast paths decline and
+/// the slow path keeps a slot below its arena's floor out of the cache
+/// `malloc` pops (`Shared::cow_deflects`). Set and cleared by `cow::begin`
+/// and `cow::end`; outside an epoch the default configurations' dispatch
+/// is unchanged.
+pub const FREE_EPOCH: u8 = 16;
+
+/// The bits of `Shared::free_flags` that change after init:
+/// [`FREE_ROUTE`] and [`FREE_EPOCH`].
+pub const FREE_DYN: u8 = 24;
+
 /// Per-thread byte counters (`thread.allocated`, `thread.deallocated`).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ThreadStats {
@@ -3088,18 +3100,46 @@ impl Heap {
         true
     }
 
+    /// [`Heap::tick`]'s fork-epoch flush, out of line so the tick keeps its
+    /// code: every cache flushed once, and the GC stamp moved past `stamp`.
+    #[cold]
+    #[inline(never)]
+    fn cow_flush(&mut self, shared: &Shared, stamp: u64, Tracked(ord): Tracked<&mut LockOrder>)
+        requires
+            crate::sys::may_abort() || crate::sys::valid_aborts(),
+            crate::sys::may_syscall(),
+            old(ord).allows(rank_class(0, 0)),
+            old(self).wf(),
+            shared.wf(),
+        ensures
+            *final(ord) == *old(ord),
+            final(self).keeps(*old(self)),
+    {
+        let now = now_ns();
+        self.last_gc = if now > stamp { now } else { stamp };
+        let ghost h0 = *self;
+        self.flush_all(shared, Tracked(&mut *ord));
+        proof {
+            Heap::lemma_keeps_trans(*old(self), h0, *self);
+        }
+    }
+
     /// Count a slow-path entry and run periodic work every
     /// [`PERIODIC_EVERY`] of them: cache GC when the interval has elapsed,
     /// then decay (or starting the background thread that will do it,
-    /// `purge::on_tick`). Nothing else: thread statistics are merged by
-    /// `epoch` (`stats.rs`), not here. `ALLOC` is whether the caller is
-    /// an allocation: a free's tick creates the thread only in a process
-    /// that has never had one (design 8.1), because glibc calls `free`
-    /// with locks held that `pthread_create` and `pthread_join` take again
-    /// (the stack cache lock, from `pthread_join`'s TLS teardown). `cell`
-    /// is the calling thread's slot cell.
-    // Hot slow-path tick: left as written so its codegen does not move.
+    /// `purge::on_tick`). Before that, on every entry, a heap whose last
+    /// cache GC is older than the start of a fork epoch flushes every
+    /// cache once ([`Heap::cow_flush`]). Nothing else: thread statistics
+    /// are merged by `epoch` (`stats.rs`), not here. `ALLOC` is whether
+    /// the caller is an allocation: a free's tick creates the thread only
+    /// in a process that has never had one (design 8.1), because glibc
+    /// calls `free` with locks held that `pthread_create` and
+    /// `pthread_join` take again (the stack cache lock, from
+    /// `pthread_join`'s TLS teardown). `cell` is the calling thread's slot
+    /// cell.
+    // Inlined into the slow paths, as written so its codegen does not move.
     #[allow(clippy::manual_is_multiple_of)]
+    #[inline(always)]
     fn tick<const ALLOC: bool>(
         &mut self,
         shared: &Shared,
@@ -3122,6 +3162,13 @@ impl Heap {
     {
         proof {
             Heap::lemma_keeps_refl(*self);
+        }
+        // A fork epoch began since this heap's last cache GC
+        // (`cow::flush_after`): its caches may hold slots below the floors,
+        // which a pop would hand out again. Flush them all, once.
+        let stamp = crate::cow::flush_after();
+        if stamp != 0 && self.last_gc < stamp {
+            self.cow_flush(shared, stamp, Tracked(&mut *ord));
         }
         self.slow_ticks = self.slow_ticks.wrapping_add(1);
         if self.slow_ticks % PERIODIC_EVERY == 0 {

@@ -2173,6 +2173,13 @@ pub ghost struct UtilRead {
     pub lowest: Option<usize>,
     pub run: Option<crate::huge::RunInfo>,
     pub closed: int,
+    /// A fork epoch's drain ([`crate::cow::drain_move`]) asked for the
+    /// block to move, from the drain floor `drain_floor` and the lowest
+    /// partial slab `drain_low` it read ([`crate::cow::drain_ok`]: its
+    /// slab is at or above the floor and a slab below it has a free slot).
+    pub drain: bool,
+    pub drain_floor: usize,
+    pub drain_low: Option<usize>,
 }
 
 /// `a - b`, or 0 below zero (`saturating_sub`).
@@ -2202,8 +2209,9 @@ pub open spec fn no_bin(u: Utilization) -> bool {
 #[verifier::opaque]
 pub open spec fn util_from(rg: crate::layout::Regions, p: usize, verbose: bool, rd: UtilRead, u: Utilization) -> bool {
     match rd.kind {
-        Kind::Slab { class, .. } => {
+        Kind::Slab { class, slab, .. } => {
             let c = class_table()[class as int];
+            let drain = rd.drain && crate::cow::drain_ok(slab as int, rd.drain_floor as int, rd.drain_low);
             if !rd.allocated || !rd.committed {
                 triple_is(u, 0, 0, 0) && no_bin(u)
             } else if c.size > crate::layout::BIN_MAX {
@@ -2213,7 +2221,9 @@ pub open spec fn util_from(rg: crate::layout::Regions, p: usize, verbose: bool, 
                 // Slab pages (docs/proposals/slab-pages.md, 3.6): the slab's
                 // open slots, and the bin's.
                 let nregs = c.nslots - rd.closed;
-                &&& triple_is(u, sat_sub(nregs, rd.live), nregs, nregs * c.size)
+                // A fork epoch's drain reports one region in use, below
+                // every defragmenter's threshold: move the block.
+                &&& triple_is(u, if drain && nregs > 1 { nregs - 1 } else { sat_sub(nregs, rd.live) }, nregs, nregs * c.size)
                 &&& if verbose && rd.found {
                     &&& u.bin_nregs == curslabs * c.nslots - rd.st.closed_slots
                     &&& u.bin_nfree == u.bin_nregs - rd.curregs
@@ -2288,6 +2298,9 @@ pub fn utilization(shared: &Shared, p: *const c_void, verbose: bool, Tracked(ord
         lowest: None,
         run: None,
         closed: 0,
+        drain: false,
+        drain_floor: 0,
+        drain_low: None,
     };
     match shared.regions.classify(p as usize) {
         Kind::Slab { class, slab, slot } => {
@@ -2359,6 +2372,23 @@ pub fn utilization(shared: &Shared, p: *const c_void, verbose: bool, Tracked(ord
                 }
             }
             u.size = u.nregs * cls.size();
+            // A fork epoch's drain (`crate::cow`): a block above the floor
+            // reads as alone in its slab, so a defragmenter moves it back
+            // into the holes the epoch left below. As above, nested `if`s.
+            #[allow(clippy::collapsible_if)]
+            if crate::cow::draining() && u.nregs > 1 {
+                if let Some(a) = shared.arenas.get_existing(d.arena_unheld(Tracked(t.desc_inv(slab as usize)))) {
+                    let (d, Ghost(f), Ghost(low)) = crate::cow::drain_move(a.class(class), slab as usize, Tracked(&mut *ord));
+                    if d {
+                        u.nfree = u.nregs - 1;
+                        proof {
+                            rd.drain = true;
+                            rd.drain_floor = f;
+                            rd.drain_low = low;
+                        }
+                    }
+                }
+            }
             // Two `if`s, not a let chain: Verus takes no let chain.
             #[allow(clippy::collapsible_if)]
             if verbose {

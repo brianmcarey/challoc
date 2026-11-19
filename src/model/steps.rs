@@ -34,6 +34,8 @@ impl Model<'_> {
             // Lock acquisitions: `self.inner.lock()` blocks while held.
             Op::Refill(_) if Refill::at(s) == Refill::Lock => sh.lock[a].is_none(),
             Op::Purge if Purge::at(s) == Purge::Lock => sh.lock[a].is_none(),
+            // `cow_mark` takes each arena's class lock in turn; one step.
+            Op::CowBegin => sh.lock.iter().all(|l| l.is_none()),
             Op::Release
                 if matches!(Release::at(s), Release::LockLiveZero | Release::LockReopen) =>
             {
@@ -77,6 +79,35 @@ impl Model<'_> {
             }
             Op::Release => self.step_release(sh, th, tid, sub),
             Op::Purge => self.step_purge(sh, th, tid, sub),
+            Op::CowBegin => {
+                // `cow::begin`: `cs.cow_mark()` for every arena (the floor
+                // is the arena's `group_next`, read under its lock), then
+                // the fork: every slab with data shares its pages.
+                th.done();
+                for a in 0..NARENAS {
+                    sh.floor[a] = sh.group_next[a];
+                }
+                sh.shares = 0;
+                for (i, s) in sh.slabs.iter().enumerate() {
+                    if s.committed
+                        && (s.state != St::Purged || self.sc.lazy)
+                        && s.state != St::Fresh
+                    {
+                        sh.shares |= 1 << i;
+                    }
+                }
+                Ok(format!(
+                    "cow_begin: floors {:?}, child shares {:#04b}",
+                    sh.floor, sh.shares
+                ))
+            }
+            Op::CowEnd => {
+                // `cow::end`: the floors go (`cow_settle`); the child exited.
+                th.done();
+                sh.floor = [0; NARENAS];
+                sh.shares = 0;
+                Ok(String::from("cow_end: floors cleared"))
+            }
         }
     }
 
@@ -119,10 +150,19 @@ impl Model<'_> {
                         ));
                     }
                     s.state = St::Purged;
-                    s.mem = 0;
                     sh.empty[a] &= !(1 << slab);
                     sh.purged[a] |= 1 << slab;
-                    desc += &format!(" slab {slab} -> Purged, memory zero;");
+                    if self.sc.lazy {
+                        // `MADV_FREE`: the pages stay until the kernel
+                        // reclaims them, contents and sharing included.
+                        desc += &format!(" slab {slab} -> Purged, lazily;");
+                    } else {
+                        s.mem = 0;
+                        // The discard leaves the parent no page the child
+                        // shares: a write faults in a new one.
+                        sh.shares &= !(1 << slab);
+                        desc += &format!(" slab {slab} -> Purged, memory zero;");
+                    }
                 }
                 if sh.empty[a] == 0 && desc == "purge:" {
                     desc += " nothing Empty;";
@@ -443,19 +483,50 @@ impl Model<'_> {
         }
     }
 
-    /// `plan` and `take`, one lock hold. Up to `MAX_PICKS` picks.
+    /// `plan`: `plan_at` under the arena's floor, and again without it
+    /// when that found nothing (the fallback). The real `plan` reads the
+    /// floor just before the lock hold; here it is read inside it.
     pub(super) fn plan_locked(
         &self,
         sh: &mut Shared,
         th: &mut Thread,
         want: u8,
     ) -> Result<String, String> {
+        let floor = if self.v.cow_floor {
+            sh.floor[th.arena as usize]
+        } else {
+            0
+        };
+        th.fallback = false;
+        let desc = self.plan_at(sh, th, want, floor)?;
+        if th.np == 0 && want > 0 && floor != 0 {
+            th.fallback = true;
+            let again = self.plan_at(sh, th, want, 0)?;
+            if th.np > 0 {
+                self.fell_back.set(true);
+            }
+            return Ok(format!(
+                "{desc} nothing above floor {floor}, again without it: {again}"
+            ));
+        }
+        Ok(desc)
+    }
+
+    /// `plan_at` and `take`, one lock hold. Up to `MAX_PICKS` picks.
+    pub(super) fn plan_at(
+        &self,
+        sh: &mut Shared,
+        th: &mut Thread,
+        want: u8,
+        floor: u8,
+    ) -> Result<String, String> {
         let a = th.arena as usize;
         let mut remaining = want;
         th.np = 0;
         let mut desc = String::from("plan:");
-        // `let mut next = g.partial.map.lowest_set(); while let Some(s) = next {`
-        let mut set = sh.partial[a];
+        // `let mut next = if floor == 0 { g.partial.map.lowest_set() } else
+        // { g.partial.map.lowest_set_from(floor) }; while let Some(s) = next {`
+        let mut set = sh.partial[a] & !((1u8 << floor) - 1);
         while let Some(s) = lowest_set(set) {
             set &= !(1 << s);
             if remaining == 0 || th.np as usize == MAX_PICKS {
@@ -476,7 +547,7 @@ impl Model<'_> {
         }
         // `while remaining > 0 && np < MAX_PICKS { let s = match self.next_slab(..) ...; self.take(..) }`
         while remaining > 0 && (th.np as usize) < MAX_PICKS {
-            let Some((s, how)) = self.next_slab(sh, th)? else {
+            let Some((s, how)) = self.next_slab(sh, th, floor)? else {
                 desc += " nothing more to commit;";
                 break;
             };
@@ -496,6 +567,9 @@ impl Model<'_> {
         remaining: &mut u8,
     ) -> Result<String, String> {
         let a = th.arena as usize;
+        if sh.floor[a] != 0 && !th.fallback && sh.shares & (1 << s) != 0 {
+            sh.copied |= 1 << s;
+        }
         let slab = &mut sh.slabs[s as usize];
         // `debug_assert_eq!(self.table().owner(slab), self.arena)`
         if sh.owner[(s >> self.sc.lg_group) as usize] != th.arena || slab.arena != th.arena {
@@ -522,8 +596,8 @@ impl Model<'_> {
             sh.partial[a] |= 1 << s;
         }
         // `let zero = state.is_zero() && (state != State::Purged || purge::purged_is_zero());`
-        // (`MADV_DONTNEED` here, so a `Purged` slab is zero.)
-        let zero = state.is_zero();
+        // (`purged_is_zero` is false once a purge was lazy.)
+        let zero = state.is_zero() && (state != St::Purged || !self.sc.lazy);
         let mut d = format!(
             " take slab {s} ({state:?}, live {live} -> {}, n {n}{})",
             slab.live,
@@ -561,18 +635,29 @@ impl Model<'_> {
         &self,
         sh: &mut Shared,
         th: &mut Thread,
+        floor: u8,
     ) -> Result<Option<(u8, String)>, String> {
         let a = th.arena as usize;
-        // `if let Some(s) = g.empty.map.lowest_set() { g.empty.map.clear(s); ... return Some(s); }`
-        if let Some(s) = lowest_set(sh.empty[a]) {
+        // `let empty = if floor == 0 { lowest_set() } else { lowest_set_from(floor) };`
+        // `if let Some(s) = empty { g.empty.map.clear(s); ... return Some(s); }`
+        // `let purged = if floor == 0 || purge::purged_is_zero() { lowest_set() }
+        // else { lowest_set_from(floor) };`: with eager purges a `Purged`
+        // slab is taken whatever the floor (the child shares none of its
+        // pages); with lazy ones only from the floor up.
+        if let Some(s) = lowest_set(sh.empty[a] & !((1u8 << floor) - 1)) {
             sh.empty[a] &= !(1 << s);
             return Ok(Some((
                 s,
                 format!("next_slab: Empty slab {s} out of the empty set"),
             )));
         }
-        // `if let Some(s) = g.purged.map.lowest_set() { g.purged.map.clear(s); ... return Some(s); }`
-        if let Some(s) = lowest_set(sh.purged[a]) {
+        // `if let Some(s) = purged { g.purged.map.clear(s); ... return Some(s); }`
+        let purged = if floor == 0 || !self.sc.lazy || !self.v.cow_lazy_floor {
+            sh.purged[a]
+        } else {
+            sh.purged[a] & !((1u8 << floor) - 1)
+        };
+        if let Some(s) = lowest_set(purged) {
             sh.purged[a] &= !(1 << s);
             return Ok(Some((
                 s,
@@ -623,6 +708,14 @@ impl Model<'_> {
     /// The invariants, at every state.
     pub(super) fn check(&self, n: &Node) -> Result<(), String> {
         let sh = &n.shared;
+        // Under a fork epoch's floor no refill hands out a slot of a slab
+        // whose pages the child shares, but in the fallback.
+        if sh.copied != 0 {
+            return Err(format!(
+                "a refill under a fork epoch's floor took slots of slabs {:#04b}, whose pages the child shares",
+                sh.copied
+            ));
+        }
         // Slots handed to two holders at once; a held slot's bit is set; a
         // slot reported zero and not yet written reads zero (the calloc
         // race).
@@ -745,7 +838,11 @@ impl Model<'_> {
                     }
                 }
                 St::Purged => {
-                    if in_purged.len() != 1 || s.live != 0 || s.bits != 0 || s.mem != 0 {
+                    if in_purged.len() != 1
+                        || s.live != 0
+                        || s.bits != 0
+                        || (s.mem != 0 && !self.sc.lazy)
+                    {
                         return Err(format!(
                             "slab {i} is Purged with live {} bits {:#06b} mem {:#06b} in {} purged sets",
                             s.live,

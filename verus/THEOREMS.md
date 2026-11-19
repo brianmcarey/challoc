@@ -416,21 +416,25 @@ the call does not return (theorem 3, which is not voided for it).
   gives, is `pac_mode()`.
 - The `free` fast path's dispatch byte (`vspec/flags.rs`;
   `Shared::free_flags`, verified over it with no precondition,
-  ensures `r & !FREE_ROUTE == self.route_fixed()`): a `RouteByte`, whose
+  ensures `r & !FREE_DYN == self.route_fixed()`): a `RouteByte`, whose
   vstd `PAtomicU8` and the atomic invariant over its permission
   (namespace `flags_ns`) are private to `vspec/flags.rs`, so the wrappers
-  `new`, `load` and `fetch_or` are its only operations. Each is verified:
-  it opens the invariant around its one `SeqCst` operation, and the
-  invariant holds the byte's bits other than `ROUTE` (`FREE_ROUTE`) at
-  its constant, the value `new` made (`flags::fixed`); `fetch_or`'s proof
-  shows an or of bits within `ROUTE` keeps them. The loom models of
+  `new`, `load`, `fetch_or` and `fetch_and` are its only operations. Each
+  is verified: it opens the invariant around its one `SeqCst` operation,
+  and the invariant holds the byte's bits other than `DYN` (`FREE_ROUTE`
+  and `FREE_EPOCH`) at its constant, the value `new` made
+  (`flags::fixed`); `fetch_or`'s and `fetch_and`'s proofs show that an or
+  of bits within `DYN`, and an and that clears only bits within it, keep
+  them. The loom models of
   `tests/loom/src/flags.rs` run the wrappers on copies of the protocol.
   `Shared::wf` ties `flags::fixed` to `push_flags`: `init` makes the
-  byte from `push_flags` (`put_flags`), and the only other write is
-  `set_multi_arena`'s `fetch_or(FREE_ROUTE)`, whose `requires` Verus
-  checks. So one load is `push_flags` up to the `FREE_ROUTE`
-  bit (`r & !FREE_ROUTE == route_fixed()`, which `Shared::wf` makes
-  `flags() & !FREE_ROUTE`), for a reader that
+  byte from `push_flags` (`put_flags`), and the only other writes are
+  `set_multi_arena`'s `fetch_or(FREE_ROUTE)` and `set_epoch`'s
+  `fetch_or(FREE_EPOCH)` and `fetch_and(!FREE_EPOCH)` (a fork epoch,
+  `crate::cow`), whose `requires` Verus checks. So one load is
+  `push_flags` up to the `FREE_DYN` bits (`r & !FREE_DYN ==
+  route_fixed()`, which `Shared::wf` makes `flags() & !FREE_DYN`), for a
+  reader that
   happens after `init` (what the `api::ready()` in `Shared::wf` stands
   for, under "One process, one `Shared`" above). With `Shared::wf` the
   byte's `PUSH_PAC` bit is `pac_mode()` and its `PUSH_ZERO` bit is
@@ -1745,7 +1749,9 @@ entry points call them:
   over `class_index`), through `free_sized_with`, which `sdallocx` with
   no flags calls too; then `shared_base`, `existing_heap`,
   `shared_deref`, `Shared::push_flags` and `heap::free_sized_fast`
-  (`heap/paths.rs`), whose `Shared::sized_slot` reads the class's line
+  (`heap/paths.rs`), which declines during a fork epoch on the
+  `free_flags` byte it reads for the push, and whose `Shared::sized_slot`
+  reads the class's line
   (`ClassLine::sized_ok`, over the guard word `ClassLine::guard_word`
   and `is_guard`).
 - `challoc_free_usable`: `tls_heap_slot`, `shared_base`,
@@ -9140,10 +9146,10 @@ library and fails unless every row's maxima equal its `budget` line in
   and, routed, the owner word (`class::load_owner`, `class/table.rs`),
   and vstd's `SeqCst` load of `Shared::free_flags` (`heap/shared.rs`,
   through `vspec::flags::load`; on x86_64 a `SeqCst` load is also a
-  `mov`). `malloc`, `free_sized` and
-  `sdallocx` read no atomic on x86_64: `push_flags` is a plain `u8`, and
-  `malloc`'s `fast_flags` load is dead off aarch64 (`PUSH_PAC` is never
-  set). Theorems 8 and 9 state the source-level half (no syscall
+  `mov`), which `free_sized` and `sdallocx` make too, for its
+  `FREE_EPOCH` bit (a fork epoch, `crate::cow`), where they read
+  `push_flags` before. `malloc` reads no atomic on x86_64: its
+  `fast_flags` load is dead off aarch64 (`PUSH_PAC` is never set). Theorems 8 and 9 state the source-level half (no syscall
   capability, no lock-taking mask); P2 is the machine-level check that
   the compiled bodies add none.
 - **P3, constant time.** The graph of each row's fast paths, as the
@@ -9181,14 +9187,14 @@ second arena exists, no push option), the routed free of theorem 26.
 | `malloc` | any | 34 | 11 | 5 | 7 | 5 | 5 |
 | `free` | `free_flags == 0` | 51 | 18 | 2 | 7 | 7 | 1 |
 | `free` | `free_flags == FREE_ROUTE` | 62 | 22 | 2 | 9 | 9 | 1 |
-| `free` | any | 67 | 22 | 2 | 12 | 9 | 6 |
-| `free_sized` | `push_flags == 0` | 40 | 13 | 2 | 6 | 7 | 1 |
-| `free_sized` | any | 42 | 13 | 2 | 7 | 7 | 2 |
-| `sdallocx` (flags 0) | `push_flags == 0` | 42 | 13 | 2 | 7 | 7 | 1 |
-| `sdallocx` (flags 0) | any | 44 | 13 | 2 | 8 | 7 | 2 |
+| `free` | any | 69 | 22 | 2 | 13 | 9 | 6 |
+| `free_sized` | `free_flags == 0` | 42 | 13 | 2 | 7 | 7 | 1 |
+| `free_sized` | any | 44 | 13 | 2 | 8 | 7 | 2 |
+| `sdallocx` (flags 0) | `free_flags == 0` | 44 | 13 | 2 | 8 | 7 | 1 |
+| `sdallocx` (flags 0) | any | 46 | 13 | 2 | 9 | 7 | 2 |
 | `challoc_free_usable` | `free_flags == 0` | 56 | 19 | 2 | 8 | 8 | 2 |
 | `challoc_free_usable` | `free_flags == FREE_ROUTE` | 67 | 23 | 2 | 10 | 10 | 2 |
-| `challoc_free_usable` | any | 72 | 23 | 2 | 13 | 10 | 7 |
+| `challoc_free_usable` | any | 74 | 23 | 2 | 14 | 10 | 7 |
 
 `malloc`'s five paths differ only in the `low_water`, `run_end` and
 `zeroed` stores (27 to 34 instructions, 2 to 5 stores); its lines are
